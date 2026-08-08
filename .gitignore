@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / local tooling
+.idea/
+.vscode/
+*.swp
+
+# Local Claude Code settings (settings.json is shared, .local.json is not)
+.claude/settings.local.json
+
+# Compose env: holds your ntfy topic, which is effectively a private address
+.env
+

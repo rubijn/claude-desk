@@ -1,0 +1,44 @@
+name: ccdeck
+
+services:
+  ccdeck:
+    build: .
+    image: ccdeck:local
+    container_name: ccdeck
+
+    # Comes back after a crash, after `docker kill`, and — the point of this file —
+    # after the Docker daemon itself restarts, so a reboot brings the board back
+    # with no intervention. Requires the container to have been running at shutdown,
+    # and Docker Desktop set to start at login (see README).
+    restart: always
+
+    # tini as PID 1. Without it, python is PID 1 and the kernel drops SIGTERM
+    # (no handler installed), so every `compose down` would wait out the 10s
+    # grace period before SIGKILL.
+    init: true
+
+    ports:
+      # Host loopback only. Hooks originate on this machine; nothing on the
+      # network has any business reaching the board.
+      - "127.0.0.1:${CCDECK_HOST_PORT:-8787}:8787"
+
+    environment:
+      CCDECK_HOST: 0.0.0.0
+      CCDECK_PORT: 8787
+      # Put these in a .env beside this file, or export them before `up`.
+      CCDECK_NTFY_TOPIC: ${CCDECK_NTFY_TOPIC:-}
+      CCDECK_BELL: ${CCDECK_BELL:-1}
+      CCDECK_ALERT_IDLE: ${CCDECK_ALERT_IDLE:-0}
+
+    # All state is in memory and dies with the process anyway.
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
