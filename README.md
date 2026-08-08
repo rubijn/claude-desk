@@ -59,6 +59,34 @@ No volumes and no network beyond that one published port: the container serves t
 and cannot reach your projects. The paths on each strip are host paths the hooks report,
 carried in the payload and displayed as text.
 
+### What the container setup is
+
+Three files, and none of them large:
+
+| File | What it does |
+|---|---|
+| `Dockerfile` | `python:3.13-slim`, no install step at all — ccdeck is standard library, so the image is the interpreter plus one file. Runs as `nobody`. Healthcheck polls `/api/state`, which exercises the lock and the snapshot, so a wedged board reports unhealthy instead of merely staying up |
+| `docker-compose.yml` | `restart: always`, the port published on `127.0.0.1` only, and the env knobs above passed through from your shell or `.env` |
+| `.dockerignore` | An allowlist — `ccdeck.py` is the only thing that enters the build context |
+
+Beyond that the service is read-only rootfs with a tmpfs `/tmp` (all state is in memory
+and dies with the process), `no-new-privileges`, and json logs capped at 3 × 5 MB so an
+always-on container can't fill the disk.
+
+Three details are load-bearing and look like clutter until they aren't:
+
+- **`COPY --chmod=0644`** — `COPY` otherwise preserves the host file's mode, and
+  `ccdeck.py` is `0600` here, so `nobody` gets `Errno 13` and `restart: always` turns
+  that into a crash loop.
+- **`init: true`** — tini as PID 1. Python as PID 1 installs no SIGTERM handler, so the
+  kernel discards the signal and every `down` or `restart` waits out the full 10-second
+  grace period before SIGKILL.
+- **`PYTHONUNBUFFERED=1`** — without it stdout block-buffers when it isn't a terminal
+  and `docker compose logs` sits there empty.
+
+Restarting clears the board, since nothing is persisted; each session reappears on its
+next hook event.
+
 ## 2. Wire Claude Code to it
 
 Add this to `~/.claude/settings.json` (user scope = every project, every terminal).
