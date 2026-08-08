@@ -8,6 +8,8 @@ phone.
 No dependencies — Python 3 standard library only. Nothing leaves your machine
 unless you turn on phone push.
 
+![The ccdeck board, one strip per Claude Code session](./images/screen.png)
+
 ## 1. Start the board
 
 Either directly:
@@ -23,7 +25,7 @@ or in Docker, which is the better bet if you want the board simply always there:
 docker compose up -d
 ```
 
-Same board, same URL either way. Open <http://127.0.0.1:8787> and click **Enable
+Same board, same URL either way. Open [http://127.0.0.1:8787](http://127.0.0.1:8787) and click **Enable
 alerts** once so the browser can raise desktop notifications, then leave the tab pinned.
 
 ### Keeping it running
@@ -125,35 +127,43 @@ If you want to be explicit about which URLs hooks may call, add to the same file
 { "allowedHttpHookUrls": ["http://127.0.0.1:8787/hook"] }
 ```
 
+
+
 ## 3. Alerts
 
-| Channel | How to turn it on |
-|---|---|
-| Browser notification + chime | Click **Enable alerts** on the board |
-| Tab badge | Automatic — the title shows `(2) ccdeck` |
+
+| Channel                      | How to turn it on                                                                                                                                                                                |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Browser notification + chime | Click **Enable alerts** on the board                                                                                                                                                             |
+| Tab badge                    | Automatic — the title shows `(2) ccdeck`                                                                                                                                                         |
 | Terminal bell / native toast | On by default. The server answers the hook with a `terminalSequence`, and Claude Code emits it for you — that's what makes the VS Code terminal tab light up, so you see *which* split needs you |
-| Phone push | Set `CCDECK_NTFY_TOPIC=di-ccdeck-<something-random>` — exported before starting, or in the `.env` under Docker — then subscribe to that topic in the ntfy app |
+| Phone push                   | Set `CCDECK_NTFY_TOPIC=di-ccdeck-<something-random>` — exported before starting, or in the `.env` under Docker — then subscribe to that topic in the ntfy app                                    |
+
 
 Environment knobs:
 
 - `CCDECK_PORT` — default `8787`
 - `CCDECK_HOST` — bind address, default `127.0.0.1`. Exists so the container can bind
-  `0.0.0.0` and still be published back onto host loopback; running directly, leave it
+`0.0.0.0` and still be published back onto host loopback; running directly, leave it
 - `CCDECK_NTFY_TOPIC` — ntfy.sh topic, empty = no phone push
 - `CCDECK_BELL` — `0` to stop returning terminal sequences
 - `CCDECK_ALERT_IDLE` — `1` to also alert on the 60-second idle notification.
-  Off by default: on several versions that event also fires after ordinary turns,
-  which is how you end up ignoring your own alerts.
+Off by default: on several versions that event also fires after ordinary turns,
+which is how you end up ignoring your own alerts.
+
+
 
 ## What each state means
 
-| State | Fired by | Meaning |
-|---|---|---|
-| `needs you` (amber) | `Notification` | Permission prompt or a question. This is the one that matters |
-| `working` (teal) | `UserPromptSubmit` | Turn in flight, clock counting up |
-| `finished` (green) | `Stop` | Turn done, last message on the strip |
-| `failed` (red) | `StopFailure` | Turn ended on an API error — rate limit, overload, billing |
-| `idle` | `SessionStart` | Session open, nothing running |
+
+| State               | Fired by           | Meaning                                                       |
+| ------------------- | ------------------ | ------------------------------------------------------------- |
+| `needs you` (amber) | `Notification`     | Permission prompt or a question. This is the one that matters |
+| `working` (teal)    | `UserPromptSubmit` | Turn in flight, clock counting up                             |
+| `finished` (green)  | `Stop`             | Turn done, last message on the strip                          |
+| `failed` (red)      | `StopFailure`      | Turn ended on an API error — rate limit, overload, billing    |
+| `idle`              | `SessionStart`     | Session open, nothing running                                 |
+
 
 Strips sort by urgency, so anything waiting on you is always at the top.
 
@@ -163,3 +173,4 @@ Strips sort by urgency, so anything waiting on you is always at the top.
 - `GET /` — the board
 - `GET /events` — server-sent event stream, if you'd rather build your own view
 - `GET /api/state` — JSON snapshot, handy for a menu-bar widget or a tmux status line
+
