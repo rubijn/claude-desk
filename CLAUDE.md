@@ -17,13 +17,16 @@ the program into modules unless asked.
 
 ```bash
 python3 ccdeck.py                    # serves http://127.0.0.1:8787
-CCDECK_PORT=9000 python3 ccdeck.py   # env knobs: CCDECK_HOST, CCDECK_PORT, CCDECK_NTFY_TOPIC, CCDECK_BELL, CCDECK_ALERT_IDLE
+CCDECK_PORT=9000 python3 ccdeck.py   # env knobs: CCDECK_HOST, CCDECK_PORT, CCDECK_NTFY_TOPIC, CCDECK_BELL, CCDECK_ALERT_IDLE, CCDECK_TRANSCRIPTS, CCDECK_USAGE_EVERY
 docker compose up -d --build         # same board, containerised, restart: always
 ```
 
 `CCDECK_HOST` defaults to `127.0.0.1` and exists only so the container can bind
 `0.0.0.0`; the compose file publishes back onto host loopback, so the hook URL is
-identical either way. Three container details are load-bearing and easy to strip as noise:
+identical either way. The compose file's one volume — `~/.claude/projects:ro` — is what
+makes the usage strip work in the container; without it `scan_usage()` returns
+`{"ok": false}` and the strip hides itself. Three container details are load-bearing and
+easy to strip as noise:
 
 - `COPY --chmod=0644` — `ccdeck.py` is mode `0600` in this checkout and plain `COPY`
   preserves it, so `USER nobody` gets `Errno 13` and `restart: always` crash-loops.
@@ -85,6 +88,56 @@ in sync when you add or rename one:
 `ATTENTION_KINDS` to a label and raises an alert. `idle_prompt` is special-cased to update
 the board without alerting, because on some Claude Code versions it also fires after
 ordinary turns; `CCDECK_ALERT_IDLE=1` opts back in.
+
+### Usage: two sources, one strip
+
+The header shows whichever of two independent sources is available, preferring the first:
+
+1. **`LIMITS`** — the real `/usage` percentages. `usage-probe.sh` (host-side, the one file
+   in this repo that is not `ccdeck.py`) reads the subscription OAuth token from the macOS
+   keychain, calls `GET /api/oauth/usage`, and POSTs the body to `POST /usage`, where
+   `ingest_limits()` turns it into one slider per bar. It has to be a separate script
+   because the container has no keychain, and it exits 0 on every failure so it is safe on
+   a `Stop` hook. ccdeck never sees the token.
+
+   Read `limits[]`, not the top-level windows: that array is what the panel itself draws —
+   `kind` (`session`, `weekly_all`, `weekly_scoped`), `percent`, `severity` (which colours
+   the bar), `resets_at`, and for a scoped bar the model name under
+   `scope.model.display_name`. The per-model bar is *only* there: the top-level
+   `seven_day_opus` / `seven_day_sonnet` keys read `null` even while the Fable bar sits at
+   32%, and the response also carries a drift of internal codename keys
+   (`nimbus_quill`, `tangelo`, …) that a generic `seven_day_*` sweep would have rendered as
+   bars. `LEGACY_WINDOWS` keeps `five_hour`/`seven_day` as a fallback for when `limits` is
+   absent. Windows close on `:59.999`, so the page rounds `resets_at` to the minute or the
+   week bar reads a day early.
+2. **`USAGE`** — local token counters, the fallback when nobody is probing.
+
+`take_limits()` keeps the last good report rather than blanking the bars on a malformed
+push. Both sources publish through the same snapshot-under-lock-then-`broadcast()` path.
+
+The token counters are the second data source: `usage_loop()` runs on its
+own daemon thread every `CCDECK_USAGE_EVERY` seconds, `scan_usage()` walks
+`CCDECK_TRANSCRIPTS` (`~/.claude/projects`) and totals the `message.usage` block of every
+assistant line into three windows — the live 5h rate-limit block, a rolling 7 days, and
+Fable within that week. It publishes `USAGE`, then reuses the same
+snapshot-under-lock-then-`broadcast()` path as `handle_event`, so the board updates with
+no hook traffic at all.
+
+These are token counts, not the percentages `/usage` shows — those are server-side and
+cached nowhere on disk. Deliberate consequences of reading the transcripts instead:
+
+- `_READ` holds a per-file byte offset so each pass parses only appended bytes, and a
+  trailing partial line is left for the next pass. `_SEEN` dedups on `id`+`requestId`,
+  because resumed sessions and sidechains write the same assistant message twice.
+- `_ENTRIES` is pruned to the 7-day window on every pass, and dropped entries release
+  their `_SEEN` key with them — otherwise that set grows without bound.
+- The 5h block starts at the top of the hour of the first message following a ≥5h gap,
+  which is how the rate-limit window is displayed; `reset_at` is 0 when no block is live.
+
+To exercise it without waiting, point it at a fixture directory:
+`CCDECK_TRANSCRIPTS=/tmp/tx CCDECK_USAGE_EVERY=2 python3 ccdeck.py`, write a `.jsonl`
+holding lines shaped `{"timestamp":…,"requestId":…,"message":{"id":…,"model":…,"usage":{…}}}`,
+then read `/api/state`.
 
 ### Never block a session
 

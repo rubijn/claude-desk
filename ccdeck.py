@@ -15,6 +15,8 @@ Environment:
   CCDECK_NTFY_TOPIC  ntfy.sh topic for phone push (optional)
   CCDECK_BELL        "1" to make Claude Code ring the terminal bell + fire a
                      native desktop notification on attention events (default 1)
+  CCDECK_TRANSCRIPTS where to read token usage from (default ~/.claude/projects)
+  CCDECK_USAGE_EVERY seconds between usage rescans (default 30; 0 disables)
 """
 
 import json
@@ -23,7 +25,7 @@ import queue
 import threading
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOST = os.environ.get("CCDECK_HOST", "127.0.0.1")
@@ -31,11 +33,15 @@ PORT = int(os.environ.get("CCDECK_PORT", "8787"))
 NTFY_TOPIC = os.environ.get("CCDECK_NTFY_TOPIC", "").strip()
 BELL = os.environ.get("CCDECK_BELL", "1") == "1"
 ALERT_IDLE = os.environ.get("CCDECK_ALERT_IDLE", "0") == "1"
+TRANSCRIPTS = os.path.expanduser(os.environ.get("CCDECK_TRANSCRIPTS", "~/.claude/projects"))
+USAGE_EVERY = int(os.environ.get("CCDECK_USAGE_EVERY", "30"))
 
 STATE_LOCK = threading.Lock()
 SESSIONS = {}          # session_id -> dict
 FEED = []              # newest-first list of notable events, capped
 SUBSCRIBERS = []       # SSE queues
+USAGE = {"ok": False}  # last transcript scan, published in every snapshot
+LIMITS = {"ok": False}  # last /api/oauth/usage report, pushed in by usage-probe.sh
 
 ATTENTION_KINDS = {
     "permission_prompt": "Permission needed",
@@ -188,6 +194,250 @@ def handle_event(ev: dict) -> dict:
     return response
 
 
+# --------------------------------------------------------------------------
+# token usage, read straight off the transcripts
+#
+# There is no local file holding the percentages the /usage panel shows - those
+# come from the server. What is on disk is every assistant message Claude Code
+# has ever written, each carrying its own `usage` block, so the board totals
+# those instead: real tokens, no credentials, works from a read-only mount.
+# --------------------------------------------------------------------------
+
+BLOCK_SPAN = 5 * 3600      # Claude Code's rate-limit window, for "now"
+WEEK_SPAN = 7 * 86400      # rolling, since the plan's reset weekday is unknown
+TOKEN_KEYS = (("in", "input_tokens"), ("out", "output_tokens"),
+              ("cache_w", "cache_creation_input_tokens"),
+              ("cache_r", "cache_read_input_tokens"))
+
+_READ = {}             # transcript path -> bytes already parsed
+_ENTRIES = []          # [ts, model, {in,out,cache_w,cache_r}, dedup key]
+_SEEN = set()          # dedup keys of everything in _ENTRIES
+
+
+def _epoch(stamp) -> float:
+    """ISO-8601 out of a transcript line -> epoch seconds, 0 if unparseable."""
+    if not isinstance(stamp, str):
+        return 0.0
+    try:
+        dt = datetime.fromisoformat(stamp.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _parse_line(line: bytes):
+    if b'"usage"' not in line:
+        return None
+    try:
+        d = json.loads(line)
+    except Exception:
+        return None
+    msg = d.get("message")
+    if not isinstance(msg, dict):
+        return None
+    use = msg.get("usage")
+    if not isinstance(use, dict):
+        return None
+    ts = _epoch(d.get("timestamp"))
+    if not ts:
+        return None
+    # The same assistant message shows up twice whenever a session is resumed
+    # or forked into a sidechain; id+requestId is what makes it one message.
+    key = "%s/%s" % (msg.get("id") or "", d.get("requestId") or "")
+    if key == "/" or key in _SEEN:
+        return None
+    counts = {}
+    for short, full in TOKEN_KEYS:
+        try:
+            counts[short] = int(use.get(full) or 0)
+        except (TypeError, ValueError):
+            counts[short] = 0
+    return [ts, str(msg.get("model") or "unknown"), counts, key]
+
+
+def _ingest(path: str, size: int) -> None:
+    """Parse only the bytes appended since the last scan."""
+    start = _READ.get(path, 0)
+    if size == start:
+        return
+    if size < start:       # truncated or replaced - start over on this file
+        start = 0
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            raw = fh.read()
+    except OSError:
+        return
+    cut = raw.rfind(b"\n")
+    if cut < 0:            # a half-written line; pick it up next time round
+        return
+    _READ[path] = start + cut + 1
+    for line in raw[:cut].split(b"\n"):
+        entry = _parse_line(line)
+        if entry:
+            _ENTRIES.append(entry)
+            _SEEN.add(entry[3])
+
+
+def _prune(now: float) -> None:
+    keep, cutoff = [], now - WEEK_SPAN
+    for entry in _ENTRIES:
+        if entry[0] >= cutoff:
+            keep.append(entry)
+        else:
+            _SEEN.discard(entry[3])
+    _ENTRIES[:] = keep
+
+
+def _window(entries) -> dict:
+    out = {"total": 0}
+    for short, _full in TOKEN_KEYS:
+        out[short] = 0
+    for _ts, _model, counts, _key in entries:
+        for short, _full in TOKEN_KEYS:
+            out[short] += counts[short]
+            out["total"] += counts[short]
+    return out
+
+
+def scan_usage() -> dict:
+    """Totals for the live 5h block, the last 7 days, and Fable within them."""
+    if not os.path.isdir(TRANSCRIPTS):
+        return {"ok": False, "reason": "no transcripts at " + TRANSCRIPTS}
+    now = time.time()
+    stale = now - WEEK_SPAN - 86400
+    for root, _dirs, names in os.walk(TRANSCRIPTS):
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(root, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if st.st_mtime < stale and path not in _READ:
+                continue
+            _ingest(path, st.st_size)
+    _prune(now)
+    entries = sorted(_ENTRIES, key=lambda e: e[0])
+
+    # Rate-limit windows open on the first message after a >=5h gap and are
+    # shown from the top of that hour, so that is how the block is bounded.
+    block_start, prev = None, None
+    for entry in entries:
+        ts = entry[0]
+        if block_start is None or ts - block_start >= BLOCK_SPAN or ts - prev >= BLOCK_SPAN:
+            block_start = ts - (ts % 3600)
+        prev = ts
+    reset_at = block_start + BLOCK_SPAN if block_start else 0
+    live = reset_at > now
+
+    week = [e for e in entries if e[0] >= now - WEEK_SPAN]
+    return {
+        "ok": True,
+        "at": now,
+        "now": _window([e for e in week if live and e[0] >= block_start]),
+        "week": _window(week),
+        "fable": _window([e for e in week if "fable" in e[1].lower()]),
+        "reset_at": reset_at if live else 0,
+        "messages": len(week),
+    }
+
+
+# The three bars `/usage` draws come from GET /api/oauth/usage, which needs the
+# subscription OAuth token - keychain-only on macOS, so unreachable from the
+# container. usage-probe.sh runs on the host, makes that one call and POSTs the
+# answer here; percentages come in, the token never does.
+
+# `limits` is the list the panel itself renders: one entry per bar, already
+# labelled by kind and scope. The top-level five_hour/seven_day objects carry the
+# same session and week numbers, so they stay as a fallback shape - but the
+# per-model bar exists only in `limits`, under scope.model.display_name.
+LIMIT_KINDS = {
+    "session": ("Current session", "now"),
+    "weekly_all": ("Current week (all models)", "week"),
+}
+LEGACY_WINDOWS = (("five_hour", "Current session", "now"),
+                  ("seven_day", "Current week (all models)", "week"))
+
+
+def _reset_epoch(value) -> float:
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        value = float(value)
+        return value / 1000.0 if value > 1e11 else value    # ms or s
+    return _epoch(value)
+
+
+def _bar(label, join, pct, resets, severity="", active=False) -> dict:
+    try:
+        pct = float(pct)
+    except (TypeError, ValueError):
+        pct = 0.0
+    return {
+        "label": label,
+        "join": join,                                       # local token window
+        "pct": max(0.0, min(100.0, round(pct, 1))),
+        "resets_at": _reset_epoch(resets),
+        "severity": str(severity or ""),
+        "active": bool(active),
+    }
+
+
+def _scoped_label(entry: dict):
+    """A scoped bar names its model in `scope`, not in `kind`."""
+    scope = entry.get("scope") or {}
+    name = ""
+    for part in (scope.get("model"), scope.get("surface")):
+        shown = part.get("display_name") if isinstance(part, dict) else None
+        if isinstance(shown, str) and shown.strip():
+            name = shown.strip()
+            break
+    if not name:
+        name = str(entry.get("kind") or "scoped").replace("_", " ").title()
+    period = "Current session" if entry.get("group") == "session" else "Current week"
+    return "%s (%s)" % (period, name), ("fable" if "fable" in name.lower() else "")
+
+
+def ingest_limits(report: dict) -> dict:
+    """Reduce one /api/oauth/usage body into the board's slider list."""
+    bars = []
+    entries = report.get("limits")
+    if isinstance(entries, list):
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("percent") is None:
+                continue
+            known = LIMIT_KINDS.get(entry.get("kind"))
+            label, join = known if known else _scoped_label(entry)
+            bars.append(_bar(label, join, entry.get("percent"), entry.get("resets_at"),
+                             entry.get("severity"), entry.get("is_active")))
+    if not bars:
+        for key, label, join in LEGACY_WINDOWS:
+            window = report.get(key)
+            if isinstance(window, dict) and window.get("utilization") is not None:
+                bars.append(_bar(label, join, window.get("utilization"),
+                                 window.get("resets_at")))
+    return {"ok": bool(bars), "at": time.time(), "bars": bars}
+
+
+def usage_loop() -> None:
+    while True:
+        try:
+            panel = scan_usage()          # file IO stays outside the lock
+        except Exception as exc:
+            print("ccdeck usage: %s" % exc)
+            panel = {"ok": False, "reason": str(exc)}
+        global USAGE
+        with STATE_LOCK:
+            USAGE = panel
+            snapshot = board_snapshot()
+        broadcast(snapshot)
+        time.sleep(USAGE_EVERY)
+
+
 def board_snapshot() -> dict:
     sessions = sorted(
         SESSIONS.values(),
@@ -201,6 +451,8 @@ def board_snapshot() -> dict:
         "now": time.time(),
         "sessions": sessions,
         "feed": FEED[:30],
+        "usage": USAGE,
+        "limits": LIMITS,
         "waiting": sum(1 for s in sessions if s["status"] in ("needs_you", "error")),
         "done": sum(1 for s in sessions if s["status"] == "done"),
     }
@@ -225,21 +477,36 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_POST(self):
-        if self.path.rstrip("/") != "/hook":
+        path = self.path.rstrip("/") or "/"
+        if path not in ("/hook", "/usage"):
             self._send(404, b'{"error":"not found"}')
             return
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length) if length else b"{}"
         try:
-            ev = json.loads(raw or b"{}")
+            body = json.loads(raw or b"{}")
         except Exception:
-            ev = {}
+            body = {}
+        out = {}
         try:
-            out = handle_event(ev)
+            if path == "/usage":
+                out = self.take_limits(body)
+            else:
+                out = handle_event(body)
         except Exception as exc:  # never let a board bug block a session
             print("ccdeck: %s" % exc)
             out = {}
         self._send(200, json.dumps(out).encode())
+
+    def take_limits(self, body: dict) -> dict:
+        global LIMITS
+        report = ingest_limits(body if isinstance(body, dict) else {})
+        with STATE_LOCK:
+            if report["ok"] or not LIMITS.get("ok"):
+                LIMITS = report                 # keep the last good report
+            snapshot = board_snapshot()
+        broadcast(snapshot)
+        return {"bars": len(report["bars"])}
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
@@ -305,6 +572,26 @@ PAGE = r"""<!doctype html>
   .count.clear{color:var(--dim)}
   .count small{font-size:11px;letter-spacing:.18em;text-transform:uppercase;
     color:var(--dim);margin-left:8px;vertical-align:middle}
+  .usage{display:flex;gap:18px;flex-wrap:wrap;align-items:baseline;
+    padding-left:18px;border-left:1px solid var(--edge)}
+  .usage span{display:block;font-size:9px;letter-spacing:.18em;text-transform:uppercase;
+    color:var(--dim);white-space:nowrap}
+  .usage b{font-weight:400;font-size:15px;color:var(--ink);
+    font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+  .usage .cold b{color:var(--dim)}
+  .usage.bars{display:grid;gap:5px;gap:5px 0}
+  .bar{display:grid;grid-template-columns:auto 118px 56px auto;gap:0 11px;
+    align-items:center;font-size:10px;letter-spacing:.06em}
+  .bar .lab{text-transform:uppercase;color:var(--dim);white-space:nowrap}
+  .bar .track{height:7px;background:#1c242d;border:1px solid var(--edge)}
+  .bar .fill{display:block;height:100%;background:var(--advisory);
+    transition:width .4s ease}
+  .bar[data-hot="warn"] .fill{background:var(--caution)}
+  .bar[data-hot="crit"] .fill{background:var(--warn)}
+  .bar .pct{color:var(--ink);font-size:11px;font-variant-numeric:tabular-nums;
+    text-align:right}
+  .bar .when{color:var(--dim);white-space:nowrap}
+  .bar.stale .fill{opacity:.45}
   .tools{margin-left:auto;display:flex;gap:8px}
   button{background:transparent;border:1px solid var(--edge);color:var(--dim);
     font:inherit;font-size:11px;letter-spacing:.1em;text-transform:uppercase;
@@ -356,6 +643,7 @@ PAGE = r"""<!doctype html>
 <header>
   <h1>ccdeck</h1>
   <div class="count clear" id="count">0<small id="countlabel">waiting on you</small></div>
+  <div class="usage" id="usage" style="display:none"></div>
   <div class="tools">
     <button id="notify">Enable alerts</button>
     <button id="sound" aria-pressed="true">Sound on</button>
@@ -375,6 +663,69 @@ function ago(sec){sec=Math.max(0,Math.round(sec));
   const m=Math.floor(sec/60);if(m<60)return m+"m "+(sec%60)+"s";
   return Math.floor(m/60)+"h "+(m%60)+"m";}
 
+function tokens(n){n=n||0;
+  if(n>=1e9)return (n/1e9).toFixed(2)+"B";
+  if(n>=1e6)return (n/1e6).toFixed(1)+"M";
+  if(n>=1e3)return Math.round(n/1e3)+"K";
+  return String(n);}
+
+function breakdown(w){return "in "+tokens(w.in)+" \u00b7 out "+tokens(w.out)
+  +" \u00b7 cache write "+tokens(w.cache_w)+" \u00b7 cache read "+tokens(w.cache_r);}
+
+function resetLabel(ts,now){
+  if(!ts)return "";
+  // windows close on :59.999, so round to the minute or the day reads one off
+  const d=new Date(Math.round(ts/60)*60000);
+  const clock=d.toLocaleTimeString([],{hour:"numeric",minute:"2-digit"})
+    .replace(/\s/g,"").toLowerCase();
+  const sameDay=new Date(now*1000).toDateString()===d.toDateString();
+  return "resets "+(sameDay?clock
+    :d.toLocaleDateString([],{month:"short",day:"numeric"})+" "+clock);
+}
+
+// Real percentages when usage-probe.sh is feeding the board; the local token
+// totals are what is left when nobody is.
+function sliders(lim,u,now){
+  const stale=now-lim.at>1800;
+  return lim.bars.map(b=>{
+    const w=u&&u.ok&&b.join?u[b.join]:null;
+    // the API grades each bar itself; thresholds only cover a missing severity
+    const hot=({normal:"ok",warning:"warn",warn:"warn",critical:"crit",crit:"crit"})[b.severity]
+      ||(b.pct>=90?"crit":b.pct>=75?"warn":"ok");
+    const tip=[b.label+": "+b.pct+"% used",
+      b.resets_at?"resets in "+ago(b.resets_at-now):"",
+      w?tokens(w.total)+" tokens locally \u00b7 "+breakdown(w):"",
+      "reported "+ago(now-lim.at)+" ago"].filter(Boolean).join("\n");
+    return `<div class="bar${stale?" stale":""}" data-hot="${hot}" title="${esc(tip)}">`
+      +`<span class="lab">${esc(b.label)}</span>`
+      +`<span class="track"><span class="fill" style="width:${b.pct}%"></span></span>`
+      +`<span class="pct">${b.pct}%</span>`
+      +`<span class="when">${resetLabel(b.resets_at,now)}</span></div>`;
+  }).join("");
+}
+
+function tokenCells(u,now){
+  const cells=[["now 5h",u.now],["7 days",u.week],["fable 7d",u.fable]].map(
+    ([label,w])=>`<div class="${w.total?"":"cold"}" title="${esc(breakdown(w))}">`
+      +`<span>${label}</span><b>${tokens(w.total)}</b></div>`);
+  cells.push(`<div class="${u.reset_at?"":"cold"}"><span>block resets</span>`
+    +`<b>${u.reset_at?ago(u.reset_at-now):"\u2014"}</b></div>`);
+  return cells.join("");
+}
+
+function usage(state,now){
+  const box=el("usage"), lim=state.limits||{}, u=state.usage||{};
+  if(lim.ok){
+    box.className="usage bars";box.style.display="grid";
+    box.innerHTML=sliders(lim,u,now);
+  }else if(u.ok){
+    box.className="usage";box.style.display="flex";
+    box.innerHTML=tokenCells(u,now);
+  }else{
+    box.style.display="none";
+  }
+}
+
 function beep(){if(!soundOn)return;try{
   const a=new (window.AudioContext||window.webkitAudioContext)();
   const o=a.createOscillator(),g=a.createGain();
@@ -392,6 +743,7 @@ function render(){
   el("count").appendChild(Object.assign(document.createElement("small"),
     {textContent:state.waiting===1?"waiting on you":"waiting on you"}));
   document.title=(state.waiting?"("+state.waiting+") ":"")+"ccdeck";
+  usage(state,now);
 
   const live=state.sessions.filter(s=>s.status!=="closed");
   el("board").innerHTML = live.length ? live.map(s=>`
@@ -451,6 +803,8 @@ if(window.Notification&&Notification.permission==="granted")
 def main():
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     srv.daemon_threads = True
+    if USAGE_EVERY > 0:
+        threading.Thread(target=usage_loop, daemon=True).start()
     # When bound to every interface (container), loopback is still how you reach it.
     shown = "127.0.0.1" if HOST in ("0.0.0.0", "::", "") else HOST
     print("ccdeck listening on http://%s:%d" % (shown, PORT))
@@ -459,6 +813,8 @@ def main():
         print("  bind address   %s" % HOST)
     if NTFY_TOPIC:
         print("  phone push     ntfy.sh/%s" % NTFY_TOPIC)
+    if USAGE_EVERY > 0:
+        print("  token usage    %s every %ds" % (TRANSCRIPTS, USAGE_EVERY))
     print("  started        %s" % datetime.now().strftime("%H:%M:%S"))
     try:
         srv.serve_forever()

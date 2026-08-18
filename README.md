@@ -49,6 +49,7 @@ Optional knobs go in a `.env` beside the compose file:
 CCDECK_NTFY_TOPIC=di-ccdeck-<something-random>
 CCDECK_HOST_PORT=8787     # host-side port, if 8787 is taken
 CCDECK_ALERT_IDLE=0
+CCDECK_USAGE_EVERY=30     # seconds between usage rescans, 0 to switch the strip off
 ```
 
 ```bash
@@ -57,9 +58,11 @@ docker compose up -d --build    # after editing ccdeck.py
 docker compose down             # stop, and stop auto-starting
 ```
 
-No volumes and no network beyond that one published port: the container serves the board
-and cannot reach your projects. The paths on each strip are host paths the hooks report,
-carried in the payload and displayed as text.
+One read-only volume and no network beyond that one published port: the container
+serves the board and cannot reach your projects. The volume is `~/.claude/projects`,
+mounted `:ro`, and it is only there so the usage strip can total your tokens; drop it
+and the rest of the board is unchanged. The paths on each strip are host paths the hooks
+report, carried in the payload and displayed as text.
 
 ### What the container setup is
 
@@ -68,7 +71,7 @@ Three files, and none of them large:
 | File | What it does |
 |---|---|
 | `Dockerfile` | `python:3.13-slim`, no install step at all — ccdeck is standard library, so the image is the interpreter plus one file. Runs as `nobody`. Healthcheck polls `/api/state`, which exercises the lock and the snapshot, so a wedged board reports unhealthy instead of merely staying up |
-| `docker-compose.yml` | `restart: always`, the port published on `127.0.0.1` only, and the env knobs above passed through from your shell or `.env` |
+| `docker-compose.yml` | `restart: always`, the port published on `127.0.0.1` only, `~/.claude/projects` mounted read-only for the usage strip, and the env knobs above passed through from your shell or `.env` |
 | `.dockerignore` | An allowlist — `ccdeck.py` is the only thing that enters the build context |
 
 Beyond that the service is read-only rootfs with a tmpfs `/tmp` (all state is in memory
@@ -150,6 +153,92 @@ Environment knobs:
 - `CCDECK_ALERT_IDLE` — `1` to also alert on the 60-second idle notification.
 Off by default: on several versions that event also fires after ordinary turns,
 which is how you end up ignoring your own alerts.
+- `CCDECK_TRANSCRIPTS` — where to read token usage from, default `~/.claude/projects`
+- `CCDECK_URL` — which board(s) `usage-probe.sh` pushes to, default
+`http://127.0.0.1:8787`, space- or comma-separated for more than one
+- `CCDECK_PROBE_EVERY` — seconds between pushes in `usage-probe.sh --watch`, default `30`
+- `CCDECK_USAGE_EVERY` — seconds between usage rescans, default `30`, `0` hides the strip
+
+
+
+## The /usage bars
+
+The header draws the same three sliders as `claude /usage` — **Current session**,
+**Current week (all models)**, **Current week (<model>)** — with the percentage used and
+when each one resets.
+
+Those percentages exist only server-side: `/usage` gets them from
+`GET /api/oauth/usage`, authenticated with your Claude subscription OAuth token, and
+nothing caches them on disk. That token is in your macOS keychain, which the container
+cannot reach — so the call is made by a host-side script that pushes the answer onto the
+board:
+
+```bash
+./usage-probe.sh --print     # see the raw API response, push nothing
+./usage-probe.sh             # push one report onto the board
+```
+
+The first run raises a macOS keychain prompt — `security` asking to read the
+`Claude Code-credentials` item. Choose **Always Allow** once and it won't ask again;
+until you do, the probe fails silently and the board keeps showing token counts.
+
+The token goes to `api.anthropic.com` and nowhere else; ccdeck only ever receives
+percentages and reset times. Then wire it to your turns, which is when the numbers
+actually move — add a second hook to the `Stop` and `SessionStart` entries in
+`~/.claude/settings.json`, alongside the HTTP ones from step 2:
+
+```json
+"Stop": [{ "hooks": [
+  { "type": "http",    "url": "http://127.0.0.1:8787/hook", "timeout": 5 },
+  { "type": "command", "command": "/absolute/path/to/ccdeck/usage-probe.sh", "timeout": 15 }
+]}]
+```
+
+It prints nothing and always exits 0, so it can't disturb a session or leak into your
+context. Percentages only move when a turn runs, which is why hooking it beats polling.
+
+Each ccdeck process holds its bars in memory, so a second board — another port, a
+`python3 ccdeck.py` next to the container — starts out with token counts only until
+something pushes to *it*. `CCDECK_URL` takes a list, so one probe can feed both:
+
+```bash
+CCDECK_URL="http://127.0.0.1:8787 http://127.0.0.1:8989" ./usage-probe.sh
+```
+
+A board that doesn't answer is skipped, not fatal. To make the hook do this permanently,
+put the assignment in front of the path in the `command` string. If you'd rather poll than hook it, `./usage-probe.sh --watch` pushes every 30
+seconds (`CCDECK_PROBE_EVERY`) — a `launchd` agent or a terminal you forget about.
+
+Without the probe the board falls back to counting tokens itself, which needs no
+credentials and works in the container.
+
+### Token counters (the fallback)
+
+Four figures next to the waiting count, refreshed every 30 seconds:
+
+| Figure | What it counts |
+|---|---|
+| **now 5h** | the live 5-hour rate-limit window — the one `/usage` calls your session |
+| **7 days** | a rolling week, since the weekday your plan resets on isn't discoverable locally |
+| **fable 7d** | the same week, restricted to `claude-fable-*` responses |
+| **block resets** | time left in the 5-hour window, or `—` when no window is open |
+
+These are **tokens, not percentages** — the honest local approximation of the bars above.
+What is on disk is every assistant message Claude Code has written, each carrying its own
+`usage` block. ccdeck walks
+`~/.claude/projects/**/*.jsonl` and adds those up — no credentials, nothing leaves the
+machine, and it works off a read-only mount. Each figure totals input, output and both
+cache counters; hover one for the breakdown. Cache reads dominate, so treat the number
+as volume rather than as anything to compare against a plan limit.
+
+When the probe *is* feeding the board the counters move into the sliders' tooltips, so
+hovering a bar shows the real percentage and the local token breakdown together.
+
+Only the bytes appended since the last pass are parsed, files untouched for over
+eight days are skipped, and a message that appears twice — resumed sessions and
+sidechains both duplicate them — is counted once, by `id` + `requestId`. Nothing here
+touches the hook path: the scan runs on its own thread and a failure just leaves the
+strip showing the previous numbers.
 
 
 

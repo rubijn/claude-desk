@@ -29,6 +29,14 @@ services:
       CCDECK_NTFY_TOPIC: ${CCDECK_NTFY_TOPIC:-}
       CCDECK_BELL: ${CCDECK_BELL:-1}
       CCDECK_ALERT_IDLE: ${CCDECK_ALERT_IDLE:-0}
+      CCDECK_TRANSCRIPTS: /transcripts
+      CCDECK_USAGE_EVERY: ${CCDECK_USAGE_EVERY:-30}
+
+    volumes:
+      # The token counters are read off the session transcripts, so the
+      # container needs to see them. Read-only, and only that one directory -
+      # without this mount the usage strip simply stays hidden.
+      - ${HOME}/.claude/projects:/transcripts:ro
 
     # All state is in memory and dies with the process anyway.
     read_only: true
