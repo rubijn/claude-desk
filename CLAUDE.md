@@ -17,7 +17,7 @@ the program into modules unless asked.
 
 ```bash
 python3 ccdeck.py                    # serves http://127.0.0.1:8787
-CCDECK_PORT=9000 python3 ccdeck.py   # env knobs: CCDECK_HOST, CCDECK_PORT, CCDECK_NTFY_TOPIC, CCDECK_BELL, CCDECK_ALERT_IDLE, CCDECK_TRANSCRIPTS, CCDECK_USAGE_EVERY
+CCDECK_PORT=9000 python3 ccdeck.py   # env knobs: CCDECK_HOST, CCDECK_PORT, CCDECK_NTFY_TOPIC, CCDECK_BELL, CCDECK_ALERT_IDLE, CCDECK_TRANSCRIPTS, CCDECK_USAGE_EVERY, CCDECK_ALERT_LIMIT
 docker compose up -d --build         # same board, containerised, restart: always
 ```
 
@@ -114,6 +114,15 @@ The header shows whichever of two independent sources is available, preferring t
 
 `take_limits()` keeps the last good report rather than blanking the bars on a malformed
 push. Both sources publish through the same snapshot-under-lock-then-`broadcast()` path.
+
+`limit_alerts()` runs on the bars of every accepted report and returns the ones that just
+crossed `CCDECK_ALERT_LIMIT` (default 80). They enter `FEED` as urgent and go out through
+`push_phone()` — the point being that crossing 100% with extra usage enabled bills
+silently instead of blocking, so the bars are the only warning. `_CROSSED` holds
+`label -> (window id, already alerted)` so a bar alerts once per window rather than once
+per push; the window id is `resets_at` floored to the minute, because the API returns it
+with sub-second jitter that would otherwise re-arm the alert on every probe. Falling back
+under the threshold also re-arms — that is what a mid-window reset looks like from here.
 
 The token counters are the second data source: `usage_loop()` runs on its
 own daemon thread every `CCDECK_USAGE_EVERY` seconds, `scan_usage()` walks

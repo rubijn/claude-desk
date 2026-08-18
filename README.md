@@ -153,6 +153,8 @@ Environment knobs:
 - `CCDECK_ALERT_IDLE` — `1` to also alert on the 60-second idle notification.
 Off by default: on several versions that event also fires after ordinary turns,
 which is how you end up ignoring your own alerts.
+- `CCDECK_ALERT_LIMIT` — alert once when a usage bar crosses this percentage,
+default `80`, `0` to switch it off. See "Getting warned before you pay" below.
 - `CCDECK_TRANSCRIPTS` — where to read token usage from, default `~/.claude/projects`
 - `CCDECK_URL` — which board(s) `usage-probe.sh` pushes to, default
 `http://127.0.0.1:8787`, space- or comma-separated for more than one
@@ -161,30 +163,51 @@ which is how you end up ignoring your own alerts.
 
 
 
-## The /usage bars
+## 4. The /usage bars
 
 The header draws the same three sliders as `claude /usage` — **Current session**,
-**Current week (all models)**, **Current week (<model>)** — with the percentage used and
-when each one resets.
+**Current week (all models)** and **Current week (<model>)** — each with the percentage
+used and when it resets.
 
-Those percentages exist only server-side: `/usage` gets them from
-`GET /api/oauth/usage`, authenticated with your Claude subscription OAuth token, and
-nothing caches them on disk. That token is in your macOS keychain, which the container
-cannot reach — so the call is made by a host-side script that pushes the answer onto the
-board:
+![The three /usage sliders in the ccdeck header](./images/usage.png)
+
+### Getting them on screen
 
 ```bash
-./usage-probe.sh --print     # see the raw API response, push nothing
-./usage-probe.sh             # push one report onto the board
+docker compose up -d --build     # or: python3 ccdeck.py
+./usage-probe.sh                 # first push - the sliders appear
+open http://127.0.0.1:8787
 ```
 
-The first run raises a macOS keychain prompt — `security` asking to read the
-`Claude Code-credentials` item. Choose **Always Allow** once and it won't ask again;
-until you do, the probe fails silently and the board keeps showing token counts.
+A board you just started shows **token counts, not sliders**. The percentages exist only
+server-side and ccdeck keeps its state in memory, so a fresh process has nothing to draw
+until something pushes a report to it — which is what `usage-probe.sh` does. Every
+`docker compose down`/`up`, rebuild or restart puts you back at that starting point until
+the next push.
+
+The first run raises a macOS keychain prompt: `security` asking to read the
+`Claude Code-credentials` item. Choose **Always Allow** once. Until you do, the probe
+fails silently and the board keeps showing token counts.
+
+### Why a separate script
+
+`/usage` gets its numbers from `GET /api/oauth/usage`, authenticated with your Claude
+subscription OAuth token, and nothing caches them on disk. That token lives in the macOS
+keychain, which the container cannot reach — so the call is made on the host and the
+answer is pushed in:
+
+```
+keychain -> usage-probe.sh -> api.anthropic.com -> POST /usage -> board -> browser (SSE)
+```
 
 The token goes to `api.anthropic.com` and nowhere else; ccdeck only ever receives
-percentages and reset times. Then wire it to your turns, which is when the numbers
-actually move — add a second hook to the `Stop` and `SessionStart` entries in
+percentages and reset times. `./usage-probe.sh --print` shows you the raw response and
+pushes nothing, which is the way to check what your account actually reports.
+
+### Keeping them fresh
+
+Percentages only move when a turn runs, so hook the probe to your turns instead of
+polling. Add a second hook to the `Stop` and `SessionStart` entries in
 `~/.claude/settings.json`, alongside the HTTP ones from step 2:
 
 ```json
@@ -194,22 +217,56 @@ actually move — add a second hook to the `Stop` and `SessionStart` entries in
 ]}]
 ```
 
-It prints nothing and always exits 0, so it can't disturb a session or leak into your
-context. Percentages only move when a turn runs, which is why hooking it beats polling.
+It prints nothing and always exits 0, so it can neither disturb a session nor leak into
+your context. With that in place you never run the probe by hand: end a turn, reload the
+board, the bars are current.
+
+If you would rather poll, `./usage-probe.sh --watch` pushes every 30 seconds
+(`CCDECK_PROBE_EVERY`) — as a `launchd` agent, or a terminal you forget about.
+
+### Getting warned before you pay
+
+Crossing a window's 100% does not stop a session when extra usage credits are enabled —
+it silently starts billing at API rates against your monthly credit cap, with no message
+in the transcript. The bars are the only warning you get, and they reset, so a window you
+overran on Tuesday reads 0% on Wednesday.
+
+So the board alerts on the way up. When any bar the probe pushes crosses
+`CCDECK_ALERT_LIMIT` (default 80%) it lands in the feed as urgent and goes out over ntfy,
+exactly like a session that needs you:
+
+```
+Current session · Usage 82%   82% used, resets 19:30. Past 100% bills as extra usage.
+```
+
+It fires **once per window**, not once per push — the probe sends the same report every
+30 seconds, and a bar parked at 85% must not alert 120 times an hour. A bar is armed
+again when its window rolls over, or when it drops back under the threshold.
+
+Every bar counts, including the per-model weekly one: the Fable bar fills at roughly
+twice the rate of Opus for the same tokens, so it is usually the first to go.
+
+To exercise it without waiting for a real window to fill:
+
+```bash
+curl -s localhost:8787/usage -d '{"limits":[{"kind":"session","percent":82,
+  "resets_at":"2026-08-18T17:30:00Z"}]}'   # -> {"bars": 1, "alerts": 1}
+```
+
+### More than one board
 
 Each ccdeck process holds its bars in memory, so a second board — another port, a
-`python3 ccdeck.py` next to the container — starts out with token counts only until
-something pushes to *it*. `CCDECK_URL` takes a list, so one probe can feed both:
+`python3 ccdeck.py` next to the container — shows token counts only until something
+pushes to *it*. `CCDECK_URL` takes a list, so one probe feeds both:
 
 ```bash
 CCDECK_URL="http://127.0.0.1:8787 http://127.0.0.1:8989" ./usage-probe.sh
 ```
 
 A board that doesn't answer is skipped, not fatal. To make the hook do this permanently,
-put the assignment in front of the path in the `command` string. If you'd rather poll than hook it, `./usage-probe.sh --watch` pushes every 30
-seconds (`CCDECK_PROBE_EVERY`) — a `launchd` agent or a terminal you forget about.
+put the assignment in front of the path in the `command` string.
 
-Without the probe the board falls back to counting tokens itself, which needs no
+Without any probe the board falls back to counting tokens itself, which needs no
 credentials and works in the container.
 
 ### Token counters (the fallback)
@@ -259,6 +316,8 @@ Strips sort by urgency, so anything waiting on you is always at the top.
 ## Endpoints
 
 - `POST /hook` — where Claude Code sends events
+- `POST /usage` — where `usage-probe.sh` pushes a `/api/oauth/usage` body, which becomes
+the three sliders
 - `GET /` — the board
 - `GET /events` — server-sent event stream, if you'd rather build your own view
 - `GET /api/state` — JSON snapshot, handy for a menu-bar widget or a tmux status line

@@ -33,6 +33,7 @@ PORT = int(os.environ.get("CCDECK_PORT", "8787"))
 NTFY_TOPIC = os.environ.get("CCDECK_NTFY_TOPIC", "").strip()
 BELL = os.environ.get("CCDECK_BELL", "1") == "1"
 ALERT_IDLE = os.environ.get("CCDECK_ALERT_IDLE", "0") == "1"
+ALERT_LIMIT = float(os.environ.get("CCDECK_ALERT_LIMIT", "80"))   # 0 disables
 TRANSCRIPTS = os.path.expanduser(os.environ.get("CCDECK_TRANSCRIPTS", "~/.claude/projects"))
 USAGE_EVERY = int(os.environ.get("CCDECK_USAGE_EVERY", "30"))
 
@@ -42,6 +43,7 @@ FEED = []              # newest-first list of notable events, capped
 SUBSCRIBERS = []       # SSE queues
 USAGE = {"ok": False}  # last transcript scan, published in every snapshot
 LIMITS = {"ok": False}  # last /api/oauth/usage report, pushed in by usage-probe.sh
+_CROSSED = {}          # bar label -> (window id, already alerted) for limit_alerts
 
 ATTENTION_KINDS = {
     "permission_prompt": "Permission needed",
@@ -423,6 +425,43 @@ def ingest_limits(report: dict) -> dict:
     return {"ok": bool(bars), "at": time.time(), "bars": bars}
 
 
+def _limit_text(bar: dict) -> str:
+    when = bar.get("resets_at") or 0
+    if when:
+        fmt = "%H:%M" if when - time.time() < 20 * 3600 else "%a %H:%M"
+        at = time.strftime(fmt, time.localtime(when))
+    else:
+        at = "?"
+    return "%.0f%% used, resets %s. Past 100%% bills as extra usage." % (bar["pct"], at)
+
+
+def limit_alerts(bars: list) -> list:
+    """Bars that just crossed CCDECK_ALERT_LIMIT, at most once per window.
+
+    The probe pushes the same report every 30s, so a bar sitting at 85% must not
+    alert 120 times an hour. A bar is armed again when its window rolls over -
+    keyed on resets_at rounded to the minute, because the API returns it with
+    sub-second jitter - or when it falls back under the threshold, which is what
+    a mid-window reset looks like from here.
+    """
+    if ALERT_LIMIT <= 0:
+        return []
+    crossed = []
+    for bar in bars:
+        label = bar["label"]
+        window = int((bar.get("resets_at") or 0) // 60)
+        seen, fired = _CROSSED.get(label, (window, False))
+        if window != seen:
+            fired = False
+        if bar["pct"] < ALERT_LIMIT:
+            fired = False
+        elif not fired:
+            fired = True
+            crossed.append(bar)
+        _CROSSED[label] = (window, fired)
+    return crossed
+
+
 def usage_loop() -> None:
     while True:
         try:
@@ -501,12 +540,27 @@ class Handler(BaseHTTPRequestHandler):
     def take_limits(self, body: dict) -> dict:
         global LIMITS
         report = ingest_limits(body if isinstance(body, dict) else {})
+        crossed = []
         with STATE_LOCK:
             if report["ok"] or not LIMITS.get("ok"):
                 LIMITS = report                 # keep the last good report
+                crossed = limit_alerts(report["bars"])
+            for bar in crossed:
+                FEED.insert(0, {
+                    "t": time.time(),
+                    "kind": "Usage %d%%" % round(bar["pct"]),
+                    "project": bar["label"],
+                    "text": _limit_text(bar),
+                    "session": "limit:" + bar["label"],
+                    "urgent": True,
+                })
+            if crossed:
+                del FEED[60:]
             snapshot = board_snapshot()
         broadcast(snapshot)
-        return {"bars": len(report["bars"])}
+        for bar in crossed:
+            push_phone("Claude usage - " + bar["label"], _limit_text(bar), "high")
+        return {"bars": len(report["bars"]), "alerts": len(crossed)}
 
     def do_GET(self):
         path = self.path.split("?")[0].rstrip("/") or "/"
